@@ -93,8 +93,8 @@ pub use crate::{
     goto_implementation::GotoImplementationConfig,
     highlight_related::{HighlightRelatedConfig, HighlightedRange},
     hover::{
-        HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult,
-        MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind, SubstTyLen,
+        FerriscopeSymbolInfo, HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData,
+        HoverResult, MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind, SubstTyLen,
     },
     inlay_hints::{
         AdjustmentHints, AdjustmentHintsMode, ClosureReturnTypeHints, DiscriminantHints,
@@ -595,6 +595,15 @@ impl Analysis {
         range: FileRange,
     ) -> Cancellable<Option<RangeInfo<HoverResult>>> {
         self.with_db(|db| hover::hover(db, range, config))
+    }
+
+    /// Returns structured symbol information for Ferriscope at a source position.
+    pub fn ferriscope_symbol_info(
+        &self,
+        config: &HoverConfig<'_>,
+        position: FilePosition,
+    ) -> Cancellable<Option<RangeInfo<FerriscopeSymbolInfo>>> {
+        self.with_db(|db| hover::ferriscope_symbol_info(db, position, config))
     }
 
     /// Returns moniker of symbol at position.

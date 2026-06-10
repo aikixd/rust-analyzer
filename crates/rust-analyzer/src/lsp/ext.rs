@@ -12,7 +12,8 @@ use lsp_types::Url;
 use lsp_types::request::Request;
 use lsp_types::{
     CodeActionKind, DocumentOnTypeFormattingParams, PartialResultParams, Position, Range,
-    TextDocumentIdentifier, WorkDoneProgressParams, notification::Notification,
+    TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
+    notification::Notification,
 };
 use paths::Utf8PathBuf;
 use rustc_hash::FxHashMap;
@@ -673,6 +674,30 @@ pub struct Hover {
     pub hover: lsp_types::Hover,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<CommandLinkGroup>,
+}
+
+pub enum FerriscopeSymbolInfoRequest {}
+
+impl Request for FerriscopeSymbolInfoRequest {
+    type Params = TextDocumentPositionParams;
+    type Result = Option<FerriscopeSymbolInfo>;
+    const METHOD: &'static str = "ferriscope/symbolInfo";
+}
+
+#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FerriscopeSymbolInfo {
+    pub range: Range,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigation: Option<lsp_types::LocationLink>,
 }
 
 #[derive(Debug, PartialEq, Clone, Default, Deserialize, Serialize)]

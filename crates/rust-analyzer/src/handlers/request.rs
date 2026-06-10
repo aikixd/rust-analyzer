@@ -1335,6 +1335,38 @@ pub(crate) fn handle_hover(
     Ok(Some(hover))
 }
 
+pub(crate) fn handle_ferriscope_symbol_info(
+    snap: GlobalStateSnapshot,
+    params: lsp_types::TextDocumentPositionParams,
+) -> anyhow::Result<Option<lsp_ext::FerriscopeSymbolInfo>> {
+    let _p = tracing::info_span!("handle_ferriscope_symbol_info").entered();
+    let position = try_default!(from_proto::file_position(&snap, params)?);
+
+    let hover = snap.config.hover(snap.minicore());
+    let info = match snap.analysis.ferriscope_symbol_info(&hover, position)? {
+        None => return Ok(None),
+        Some(info) => info,
+    };
+
+    let line_index = snap.file_line_index(position.file_id)?;
+    let range = to_proto::range(&line_index, info.range);
+    let origin = FileRange { file_id: position.file_id, range: info.range };
+    let navigation = info
+        .info
+        .navigation
+        .map(|target| to_proto::location_link(&snap, Some(origin), target))
+        .transpose()?;
+
+    Ok(Some(lsp_ext::FerriscopeSymbolInfo {
+        range,
+        name: info.info.name,
+        kind: info.info.kind,
+        rust_path: info.info.rust_path,
+        label: info.info.label,
+        navigation,
+    }))
+}
+
 pub(crate) fn handle_prepare_rename(
     snap: GlobalStateSnapshot,
     params: lsp_types::TextDocumentPositionParams,

@@ -16,11 +16,11 @@ use ide_db::{
 };
 use itertools::{Itertools, multizip};
 use macros::UpmapFromRaFixture;
-use span::{Edition, TextRange};
+use span::{Edition, TextRange, TextSize};
 use syntax::{
     AstNode, AstToken,
     SyntaxKind::{self, *},
-    SyntaxNode, T, ast,
+    SyntaxNode, SyntaxToken, T, ast,
 };
 
 use crate::{
@@ -122,6 +122,23 @@ pub struct HoverResult {
     pub actions: Vec<HoverAction>,
 }
 
+#[derive(Clone, Debug)]
+pub struct FerriscopeSymbolInfo {
+    pub name: Option<String>,
+    pub kind: Option<String>,
+    pub rust_path: Option<String>,
+    pub label: Option<String>,
+    pub navigation: Option<NavigationTarget>,
+}
+
+struct DefinitionHoverTarget<'db> {
+    def: Definition,
+    subst: Option<GenericSubstitution<'db>>,
+    macro_arm: Option<u32>,
+    render_extras: bool,
+    node: SyntaxNode,
+}
+
 // Feature: Hover
 //
 // Shows additional information, like the type of an expression or the documentation for a definition when "focusing" code.
@@ -156,6 +173,48 @@ pub(crate) fn hover(
     Some(res)
 }
 
+pub(crate) fn ferriscope_symbol_info(
+    db: &RootDatabase,
+    FilePosition { file_id, offset }: FilePosition,
+    config: &HoverConfig<'_>,
+) -> Option<RangeInfo<FerriscopeSymbolInfo>> {
+    let sema = &hir::Semantics::new(db);
+    let file = sema.parse_guess_edition(file_id).syntax().clone();
+    let edition = sema.attach_first_edition(file_id).edition(db);
+    let display_target = sema.first_crate(file_id)?.to_display_target(db);
+    let original_token = best_hover_token(&file, offset, edition)?;
+
+    if let Some((range, _, _, resolution)) =
+        sema.check_for_format_args_template(original_token.clone(), offset)
+    {
+        let info = symbol_info_for_definition(
+            sema,
+            Definition::from(resolution?),
+            config,
+            edition,
+            display_target,
+        );
+        return Some(RangeInfo::new(range, info));
+    }
+
+    let mut descended = sema.descend_into_macros(original_token.clone());
+    let ranker = Ranker::from_token(&original_token);
+    descended.sort_by_cached_key(|tok| !ranker.rank_token(tok));
+
+    for token in descended {
+        let Some(targets) = definition_targets_for_token(sema, token) else {
+            continue;
+        };
+        if let Some(info) = targets.into_iter().next().map(|target| {
+            symbol_info_for_definition(sema, target.def, config, edition, display_target)
+        }) {
+            return Some(RangeInfo::new(original_token.text_range(), info));
+        }
+    }
+
+    None
+}
+
 #[allow(clippy::field_reassign_with_default)]
 fn hover_offset(
     sema: &Semantics<'_, RootDatabase>,
@@ -165,22 +224,7 @@ fn hover_offset(
     edition: Edition,
     display_target: DisplayTarget,
 ) -> Option<RangeInfo<HoverResult>> {
-    let original_token = pick_best_token(file.token_at_offset(offset), |kind| match kind {
-        IDENT
-        | INT_NUMBER
-        | LIFETIME_IDENT
-        | T![self]
-        | T![super]
-        | T![crate]
-        | T![Self]
-        | T![_] => 4,
-        // index and prefix ops and closure pipe
-        T!['['] | T![']'] | T![?] | T![*] | T![-] | T![!] | T![|] => 3,
-        kind if kind.is_keyword(edition) => 2,
-        T!['('] | T![')'] => 2,
-        kind if kind.is_trivia() => 0,
-        _ => 1,
-    })?;
+    let original_token = best_hover_token(&file, offset, edition)?;
 
     if let Some(doc_comment) = token_as_doc_comment(&original_token) {
         cov_mark::hit!(no_highlight_on_comment_hover);
@@ -254,58 +298,9 @@ fn hover_offset(
             res.push(lint_hover);
             continue;
         }
-        let definitions = (|| {
-            Some(
-                'a: {
-                    let node = token.parent()?;
-
-                    // special case macro calls, we wanna render the invoked arm index
-                    if let Some(name) = ast::NameRef::cast(node.clone())
-                        && let Some(path_seg) =
-                            name.syntax().parent().and_then(ast::PathSegment::cast)
-                            && let Some(macro_call) = path_seg
-                                .parent_path()
-                                .syntax()
-                                .parent()
-                                .and_then(ast::MacroCall::cast)
-                                && let Some(macro_) = sema.resolve_macro_call(&macro_call) {
-                                    break 'a vec![(
-                                        (Definition::Macro(macro_), None),
-                                        sema.resolve_macro_call_arm(&macro_call),
-                                        false,
-                                        node,
-                                    )];
-                                }
-
-                    match IdentClass::classify_node(sema, &node)? {
-                        // It's better for us to fall back to the keyword hover here,
-                        // rendering poll is very confusing
-                        IdentClass::Operator(OperatorClass::Await(_)) => return None,
-
-                        IdentClass::NameRefClass(NameRefClass::ExternCrateShorthand {
-                            decl,
-                            ..
-                        }) => {
-                            vec![((Definition::ExternCrateDecl(decl), None), None, false, node)]
-                        }
-
-                        class => {
-                            let render_extras = matches!(class, IdentClass::NameClass(_))
-                                // Render extra information for `Self` keyword as well
-                                || ast::NameRef::cast(node.clone()).is_some_and(|name_ref| name_ref.token_kind() == SyntaxKind::SELF_TYPE_KW);
-                            multizip((
-                                class.definitions(),
-                                iter::repeat(None),
-                                iter::repeat(render_extras),
-                                iter::repeat(node),
-                            ))
-                            .collect::<Vec<_>>()
-                        }
-                    }
-                }
-                .into_iter()
-                .unique_by(|&((def, _), _, _, _)| def)
-                .map(|((def, subst), macro_arm, hovered_definition, node)| {
+        if let Some(definitions) = definition_targets_for_token(sema, token.clone()) {
+            res.extend(definitions.into_iter().map(
+                |DefinitionHoverTarget { def, subst, macro_arm, render_extras, node }| {
                     hover_for_definition(
                         sema,
                         file_id,
@@ -313,17 +308,13 @@ fn hover_offset(
                         subst,
                         &node,
                         macro_arm,
-                        hovered_definition,
+                        render_extras,
                         config,
                         edition,
                         display_target,
                     )
-                })
-                .collect::<Vec<_>>(),
-            )
-        })();
-        if let Some(definitions) = definitions {
-            res.extend(definitions);
+                },
+            ));
             continue;
         }
         let keywords = || render::keyword(sema, config, &token, edition, display_target);
@@ -394,6 +385,114 @@ fn hover_offset(
             res.actions = dedupe_or_merge_hover_actions(res.actions);
             RangeInfo::new(original_token.text_range(), res)
         })
+}
+
+fn best_hover_token(file: &SyntaxNode, offset: TextSize, edition: Edition) -> Option<SyntaxToken> {
+    pick_best_token(file.token_at_offset(offset), |kind| match kind {
+        IDENT
+        | INT_NUMBER
+        | LIFETIME_IDENT
+        | T![self]
+        | T![super]
+        | T![crate]
+        | T![Self]
+        | T![_] => 4,
+        // index and prefix ops and closure pipe
+        T!['['] | T![']'] | T![?] | T![*] | T![-] | T![!] | T![|] => 3,
+        kind if kind.is_keyword(edition) => 2,
+        T!['('] | T![')'] => 2,
+        kind if kind.is_trivia() => 0,
+        _ => 1,
+    })
+}
+
+fn definition_targets_for_token<'db>(
+    sema: &Semantics<'db, RootDatabase>,
+    token: SyntaxToken,
+) -> Option<Vec<DefinitionHoverTarget<'db>>> {
+    Some(
+        'a: {
+            let node = token.parent()?;
+
+            // special case macro calls, we wanna render the invoked arm index
+            if let Some(name) = ast::NameRef::cast(node.clone())
+                && let Some(path_seg) = name.syntax().parent().and_then(ast::PathSegment::cast)
+                && let Some(macro_call) =
+                    path_seg.parent_path().syntax().parent().and_then(ast::MacroCall::cast)
+                && let Some(macro_) = sema.resolve_macro_call(&macro_call)
+            {
+                break 'a vec![DefinitionHoverTarget {
+                    def: Definition::Macro(macro_),
+                    subst: None,
+                    macro_arm: sema.resolve_macro_call_arm(&macro_call),
+                    render_extras: false,
+                    node,
+                }];
+            }
+
+            match IdentClass::classify_node(sema, &node)? {
+                // It's better for us to fall back to the keyword hover here,
+                // rendering poll is very confusing
+                IdentClass::Operator(OperatorClass::Await(_)) => return None,
+
+                IdentClass::NameRefClass(NameRefClass::ExternCrateShorthand { decl, .. }) => {
+                    vec![DefinitionHoverTarget {
+                        def: Definition::ExternCrateDecl(decl),
+                        subst: None,
+                        macro_arm: None,
+                        render_extras: false,
+                        node,
+                    }]
+                }
+
+                class => {
+                    let render_extras = matches!(class, IdentClass::NameClass(_))
+                        // Render extra information for `Self` keyword as well
+                        || ast::NameRef::cast(node.clone())
+                            .is_some_and(|name_ref| name_ref.token_kind() == SyntaxKind::SELF_TYPE_KW);
+                    multizip((
+                        class.definitions(),
+                        iter::repeat(None),
+                        iter::repeat(render_extras),
+                        iter::repeat(node),
+                    ))
+                    .map(|((def, subst), macro_arm, render_extras, node)| {
+                        DefinitionHoverTarget { def, subst, macro_arm, render_extras, node }
+                    })
+                    .collect::<Vec<_>>()
+                }
+            }
+        }
+        .into_iter()
+        .unique_by(|target| target.def)
+        .collect::<Vec<_>>(),
+    )
+}
+
+fn symbol_info_for_definition(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    config: &HoverConfig<'_>,
+    edition: Edition,
+    display_target: DisplayTarget,
+) -> FerriscopeSymbolInfo {
+    let db = sema.db;
+    let navigation = def.try_to_nav(sema).map(|nav| nav.call_site());
+    let name = navigation.as_ref().map(|nav| nav.name.to_string());
+    let kind = navigation.as_ref().and_then(|nav| nav.kind.map(|kind| format!("{kind:?}")));
+    let rust_path = render::definition_path(db, &def, edition).and_then(|owner_path| match &name {
+        Some(name) if !owner_path.is_empty() => Some(format!("{owner_path}::{name}")),
+        Some(name) => Some(name.clone()),
+        None => Some(owner_path),
+    });
+
+    FerriscopeSymbolInfo {
+        name,
+        kind,
+        rust_path,
+        label: Some(render::definition_label(db, def, config, display_target)),
+        navigation,
+    }
 }
 
 fn hover_ranged(

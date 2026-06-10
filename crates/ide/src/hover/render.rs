@@ -463,40 +463,12 @@ pub(super) fn definition(
     display_target: DisplayTarget,
 ) -> (Markup, Option<hir::Docs>) {
     let mod_path = definition_path(db, &def, edition);
-    let label = match def {
-        Definition::Trait(trait_) => trait_
-            .display_limited(db, config.max_trait_assoc_items_count, display_target)
-            .to_string(),
-        Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => {
-            adt.display_limited(db, config.max_fields_count, display_target).to_string()
-        }
-        Definition::EnumVariant(variant) => {
-            variant.display_limited(db, config.max_fields_count, display_target).to_string()
-        }
-        Definition::Adt(adt @ Adt::Enum(_)) => {
-            adt.display_limited(db, config.max_enum_variants_count, display_target).to_string()
-        }
-        Definition::SelfType(impl_def) => {
-            let self_ty = &impl_def.self_ty(db);
-            match self_ty.as_adt() {
-                Some(adt) => {
-                    adt.display_limited(db, config.max_fields_count, display_target).to_string()
-                }
-                None => self_ty.display(db, display_target).to_string(),
-            }
-        }
-        Definition::Macro(it) => {
-            let mut label = it.display(db, display_target).to_string();
-            if let Some(macro_arm) = macro_arm {
-                format_to!(label, " // matched arm #{}", macro_arm);
-            }
-            label
-        }
-        Definition::Function(fn_) => {
-            fn_.display_with_container_bounds(db, true, display_target).to_string()
-        }
-        _ => def.label(db, display_target),
-    };
+    let mut label = definition_label(db, def, config, display_target);
+    if matches!(def, Definition::Macro(_))
+        && let Some(macro_arm) = macro_arm
+    {
+        format_to!(label, " // matched arm #{}", macro_arm);
+    }
     let docs = def.docs_with_rangemap(db, famous_defs, display_target);
     let value = || match def {
         Definition::EnumVariant(it) => {
@@ -1071,7 +1043,11 @@ fn closure_ty(
     Some(res)
 }
 
-fn definition_path(db: &RootDatabase, &def: &Definition, edition: Edition) -> Option<String> {
+pub(super) fn definition_path(
+    db: &RootDatabase,
+    &def: &Definition,
+    edition: Edition,
+) -> Option<String> {
     if matches!(
         def,
         Definition::TupleField(_)
@@ -1087,6 +1063,42 @@ fn definition_path(db: &RootDatabase, &def: &Definition, edition: Edition) -> Op
     }
     let rendered_parent = definition_owner_name(db, def, edition);
     def.module(db).map(|module| path(db, module, rendered_parent, edition))
+}
+
+pub(super) fn definition_label(
+    db: &RootDatabase,
+    def: Definition,
+    config: &HoverConfig<'_>,
+    display_target: DisplayTarget,
+) -> String {
+    match def {
+        Definition::Trait(trait_) => trait_
+            .display_limited(db, config.max_trait_assoc_items_count, display_target)
+            .to_string(),
+        Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => {
+            adt.display_limited(db, config.max_fields_count, display_target).to_string()
+        }
+        Definition::EnumVariant(variant) => {
+            variant.display_limited(db, config.max_fields_count, display_target).to_string()
+        }
+        Definition::Adt(adt @ Adt::Enum(_)) => {
+            adt.display_limited(db, config.max_enum_variants_count, display_target).to_string()
+        }
+        Definition::SelfType(impl_def) => {
+            let self_ty = &impl_def.self_ty(db);
+            match self_ty.as_adt() {
+                Some(adt) => {
+                    adt.display_limited(db, config.max_fields_count, display_target).to_string()
+                }
+                None => self_ty.display(db, display_target).to_string(),
+            }
+        }
+        Definition::Macro(it) => it.display(db, display_target).to_string(),
+        Definition::Function(fn_) => {
+            fn_.display_with_container_bounds(db, true, display_target).to_string()
+        }
+        _ => def.label(db, display_target),
+    }
 }
 
 fn markup(
